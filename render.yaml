@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: stock-forecast-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: HF_REPO_ID
+        value: gulabjangid/Stock_forecast

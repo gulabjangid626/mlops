@@ -1,0 +1,7 @@
+prophet
+pandas
+yfinance
+evidently
+dagshub
+mlflow
+huggingface_hub

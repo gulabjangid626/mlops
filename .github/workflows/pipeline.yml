@@ -1,0 +1,263 @@
+name: Stock Forecast MLOps Pipeline
+
+on:
+  schedule:
+    - cron: "30 20 * * *" # 02:00 AM IST daily
+  workflow_dispatch:
+    inputs:
+      skip_drift_gate:
+        description: "Set to true to force push even if no retrain recommended"
+        required: false
+        default: "false"
+
+env:
+  PYTHON_VERSION: "3.11"
+  # Single venv path reused by every job via cache restore
+  VENV_PATH: .venv
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 0 — Build & cache the shared virtualenv ONCE
+  # Every downstream job restores this cache instead of running pip install.
+  # Cache key = hash of requirements.txt, so it is only rebuilt when deps change.
+  # ─────────────────────────────────────────────────────────────────────────
+  setup:
+    name: "Setup: Build shared virtualenv"
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Compute cache key
+        id: cache-key
+        run: |
+          echo "key=venv-${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore venv from cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ steps.cache-key.outputs.key }}
+
+      # Only runs when requirements.txt has changed (cache miss)
+      - name: Install dependencies into venv
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: |
+          python -m venv ${{ env.VENV_PATH }}
+          ${{ env.VENV_PATH }}/bin/pip install --upgrade pip
+          ${{ env.VENV_PATH }}/bin/pip install -r requirements.txt
+
+      - name: Save venv to cache
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ steps.cache-key.outputs.key }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Ingest
+  # ─────────────────────────────────────────────────────────────────────────
+  ingest:
+    name: "Ingest: Fetch 5y price data"
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Restore the pre-built venv — no pip install needed
+      - name: Restore venv from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Ingest price data
+        working-directory: src
+        run: |
+          source ../${{ env.VENV_PATH }}/bin/activate
+          python ingest.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stock-data
+          path: src/data/stocks/
+          retention-days: 3
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Train
+  # ─────────────────────────────────────────────────────────────────────────
+  train:
+    name: "Train: Prophet per ticker + MLflow"
+    runs-on: ubuntu-latest
+    needs: [setup, ingest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore venv from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stock-data
+          path: src/data/stocks/
+
+      - name: Train all models
+        env:
+          DAGSHUB_USER_TOKEN: ${{ secrets.DAGSHUB_USER_TOKEN  }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME  }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD  }}
+        working-directory: src
+        run: |
+          source ../${{ env.VENV_PATH }}/bin/activate
+          python train.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trained-models
+          path: src/data/stocks/*_model.pkl
+          retention-days: 3
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Drift detection
+  # ─────────────────────────────────────────────────────────────────────────
+  drift:
+    name: "Drift Detection: Returns + Residuals"
+    runs-on: ubuntu-latest
+    needs: [setup, ingest, train]
+    outputs:
+      any_retrain: ${{ steps.drift-check.outputs.any_retrain }}
+      retrain_tickers: ${{ steps.drift-check.outputs.retrain_tickers }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore venv from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stock-data
+          path: src/data/stocks/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: trained-models
+          path: src/data/stocks/
+
+      - name: Run drift detection
+        id: drift-check
+        working-directory: src
+        run: |
+          source ../${{ env.VENV_PATH }}/bin/activate
+          python drift.py
+          python - <<'EOF'
+          import json, os
+          with open("reports/drift_summary.json") as f:
+              summary = json.load(f)
+          retrain = [t for t, v in summary.items() if v.get("retrain_recommended")]
+          any_retrain = "true" if retrain else "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+              gh.write(f"any_retrain={any_retrain}\n")
+              gh.write(f"retrain_tickers={','.join(retrain)}\n")
+          print(f"Retrain recommended: {retrain or 'none'}")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drift-reports
+          path: src/reports/
+          retention-days: 14
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 4 — Push models to Hugging Face Hub
+  # ─────────────────────────────────────────────────────────────────────────
+  push:
+    name: "Push Models to Hugging Face Hub"
+    runs-on: ubuntu-latest
+    needs: [setup, train, drift]
+    if: >
+      needs.drift.outputs.any_retrain == 'true' ||
+      github.event.inputs.skip_drift_gate == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore venv from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VENV_PATH }}
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: trained-models
+          path: src/data/stocks/
+
+      - name: Push models
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        working-directory: src
+        run: |
+          source ../${{ env.VENV_PATH }}/bin/activate
+          python push_model.py
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 5 — Commit updated CSVs back to repo
+  # Depends on ingest+drift only — runs regardless of drift gate result.
+  # ─────────────────────────────────────────────────────────────────────────
+  commit-data:
+    name: "Commit Updated CSVs back to repo"
+    runs-on: ubuntu-latest
+    needs: [ingest, drift]
+    if: always()
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stock-data
+          path: src/data/stocks/
+
+      - name: Commit updated data
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name  "GitHub Actions Bot"
+          git add src/data/stocks/*.csv
+          git diff --staged --quiet || \
+            git commit -m "chore(data): auto-update stock CSVs $(date -u '+%Y-%m-%d')"
+          git push origin HEAD:${{ github.ref_name }}
